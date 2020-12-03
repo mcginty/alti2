@@ -8,6 +8,7 @@ use std::{
     fmt,
     io::{Read, Write},
     path::Path,
+    num::Wrapping,
     thread::sleep,
     time::Duration,
 };
@@ -133,34 +134,38 @@ impl Cipher {
     }
 
     pub fn encrypt_single(&self, v: &[u32]) -> [u32; 2] {
-        let mut u = v[0];
-        let mut u1 = v[1];
-        let mut u2 = 0u32;
+        let mut u = Wrapping(v[0]);
+        let mut u1 = Wrapping(v[1]);
+        let mut u2 = Wrapping(0u32);
 
         for _ in 0..16 {
-            u += (((u1 << 4) ^ (u1 >> 5)) + u1) ^ (u2 + self.k[(u2 & 3) as usize]);
-            u2 += 0x9E3779B9;
-            u1 += (((u << 4) ^ (u >> 5)) + u) ^ (u2 + self.k[((u2 >> 11) & 3) as usize]);
+            u += (((u1 << 4) ^ (u1 >> 5)) + u1) ^ (u2 + Wrapping(self.k[(u2.0 & 3) as usize]));
+            u2 += Wrapping(0x9E3779B9);
+            u1 += (((u << 4) ^ (u >> 5)) + u) ^ (u2 + Wrapping(self.k[((u2.0 >> 11) & 3) as usize]));
         }
 
-        [u, u1]
+        [u.0, u1.0]
     }
 
     pub fn decrypt_single(&self, v: &[u32]) -> [u32; 2] {
-        let mut u = v[0];
-        let mut u1 = v[1];
-        let mut u2 = 0xE3779B90;
+        let mut u = Wrapping(v[0]);
+        let mut u1 = Wrapping(v[1]);
+        let mut u2 = Wrapping(0xE3779B90);
 
         for _ in 0..16 {
-            u1 -= (((u << 4) ^ (u >> 5)) + u) ^ (u2 + self.k[((u2 >> 11) & 3) as usize]);
-            u2 -= 0x9E3779B9;
-            u -= (((u1 << 4) ^ (u1 >> 5)) + u1) ^ (u2 + self.k[(u2 & 3) as usize]);
+            u1 -= (((u << 4) ^ (u >> 5)) + u) ^ (u2 + Wrapping(self.k[((u2.0 >> 11) & 3) as usize]));
+            u2 -= Wrapping(0x9E3779B9);
+            u -= (((u1 << 4) ^ (u1 >> 5)) + u1) ^ (u2 + Wrapping(self.k[(u2.0 & 3) as usize]));
         }
 
-        [u, u1]
+        [u.0, u1.0]
     }
 
     pub fn encrypt(&self, bytes: &[u8]) -> Vec<u8> {
+        let mut bytes = bytes.to_vec();
+        let len = bytes.len();
+        bytes.resize(len + (if len % 32 != 0 { 32 - len % 32 } else { 0 }), 0);
+
         let u32s: Vec<u32> = bytes
             .chunks(4)
             .map(|chunk| {
@@ -184,6 +189,10 @@ impl Cipher {
     }
 
     pub fn decrypt(&self, bytes: &[u8]) -> Vec<u8> {
+        let mut bytes = bytes.to_vec();
+        let len = bytes.len();
+        bytes.resize(len + (if len % 32 != 0 { 32 - len % 32 } else { 0 }), 0);
+
         let u32s: Vec<u32> = bytes
             .chunks(4)
             .map(|chunk| {
@@ -264,4 +273,27 @@ fn main() -> Result<(), Error> {
     println!("device: {}", session.device_info);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    static TYPE0_RESPONSE: &[u8] = &[
+        0x1E, 0x00, 0x05, 0x10, 0x03, 0x59, 0x31, 0x38, 0x33, 0x36, 0x34, 0x31, 0x20, 0x20, 0x02, 0x07, 0x01, 0x00, 0x20, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x05, 0x00, 0x00, 0x38,
+    ];
+
+    // static ENCRYPTED_RESPONSE: &[u8] = &[
+    //     0x31, 0x35, 0xe5, 0x73, 0x0e, 0x3f, 0xed, 0xa7, 0x15, 0x52, 0x00, 
+    //     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    //     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    // ];
+
+    #[test]
+    fn test_cipher_roundtrip() {
+        static TEST_PAYLOAD: &[u8] = &[1, 170, 170];
+        let cipher = Cipher::from_type0_bytes(TYPE0_RESPONSE);
+        let encrypted = cipher.encrypt(TEST_PAYLOAD);
+        assert_eq!(&cipher.decrypt(&encrypted)[..TEST_PAYLOAD.len()], TEST_PAYLOAD);
+    }
 }
