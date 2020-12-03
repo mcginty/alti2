@@ -1,20 +1,29 @@
-use std::io::{Read, Write};
-use std::path::Path;
-use std::time::Duration;
-use serial::core::{SerialDevice, SerialPortSettings};
-use serial::{BaudRate, Parity, CharSize, FlowControl, StopBits};
-use std::thread::sleep;
-use std::fmt;
 use anyhow::{ensure, Error};
+use serial::{
+    core::{SerialDevice, SerialPortSettings},
+    BaudRate, CharSize, FlowControl, Parity, StopBits,
+};
+use std::{
+    convert::TryFrom,
+    fmt,
+    io::{Read, Write},
+    path::Path,
+    thread::sleep,
+    time::Duration,
+};
 
 static TTY_TIMEOUT: Duration = Duration::from_millis(10000);
 static PAUSE_BEFORE_HANDSHAKE: Duration = Duration::from_secs(10);
+
+fn checksum(bytes: &[u8]) -> u8 {
+    bytes.iter().fold(0, |acc, b| acc.wrapping_add(*b))
+}
 
 #[derive(Debug)]
 struct SoftwareVersion {
     major: usize,
     minor: usize,
-    revision: usize
+    revision: usize,
 }
 
 impl fmt::Display for SoftwareVersion {
@@ -32,7 +41,7 @@ enum ProductType {
     N3,
     N3A,
     Atlas,
-    Unknown
+    Unknown,
 }
 
 impl From<u8> for ProductType {
@@ -63,13 +72,21 @@ struct DeviceInfo {
 
 impl fmt::Display for DeviceInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Alti-2 {:?} (rev. {}, S/N {}, S/W {})", self.product_type, self.hardware_revision, self.serial_number, self.sw_version)
+        write!(
+            f,
+            "Alti-2 {:?} (rev. {}, S/N {}, S/W {})",
+            self.product_type, self.hardware_revision, self.serial_number, self.sw_version
+        )
     }
 }
 
-impl<'a> From<&'a [u8]> for DeviceInfo {
-    fn from(bytes: &[u8]) -> Self {
-        Self {
+impl<'a> TryFrom<&'a [u8]> for DeviceInfo {
+    type Error = Error;
+
+    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+        ensure!(checksum(&bytes[1..bytes.len()-1]) == bytes[bytes.len()-1], "checksum mismatch");
+
+        Ok(Self {
             original_record: bytes.to_vec(),
             comm_type: bytes[2],
             sw_version: SoftwareVersion {
@@ -77,11 +94,11 @@ impl<'a> From<&'a [u8]> for DeviceInfo {
                 minor: (bytes[3] & 0x0f) as usize,
                 revision: bytes[4] as usize,
             },
-            serial_number: String::from_utf8_lossy(&bytes[5..14]).trim().to_string(),
+            serial_number: String::from_utf8(bytes[5..14].to_vec())?.trim().to_string(),
             hardware_revision: bytes[14],
             product_type: ProductType::from(bytes[15]),
             nvram_config: bytes[16],
-        }
+        })
     }
 }
 
@@ -94,7 +111,7 @@ impl Command {
     /// the string "018080", prepending the length and appending the checksum.
     pub fn to_bytes(&self) -> Vec<u8> {
         let contents = match self {
-            Command::GetInfo => vec![0x80]
+            Command::GetInfo => vec![0x80],
         };
         let mut bytes = vec![];
         bytes.extend_from_slice(hex::encode_upper(&[contents.len() as u8]).as_bytes());
@@ -102,11 +119,6 @@ impl Command {
         bytes.extend_from_slice(hex::encode_upper(&[checksum(&contents)]).as_bytes());
         bytes
     }
-}
-
-fn checksum(bytes: &[u8]) -> u8 {
-    bytes.iter()
-        .fold(0, |acc, b| acc.wrapping_add(*b))
 }
 
 struct AltiTTY {
@@ -143,13 +155,13 @@ impl AltiTTY {
 
         // (len+1) to include the checksum byte, multiply by 3 for each "XX " spaced combination of hex,
         // then add 2 for the "\r\n" ending.
-        let remaining_ascii_len = (len+1) * 3 + 2;
-        self.tty.read_exact(&mut buf[3..3+remaining_ascii_len])?;
+        let remaining_ascii_len = (len + 1) * 3 + 2;
+        self.tty.read_exact(&mut buf[3..3 + remaining_ascii_len])?;
 
-        let info_str = String::from_utf8(buf[..2+remaining_ascii_len].to_vec())?;
+        let info_str = String::from_utf8(buf[..2 + remaining_ascii_len].to_vec())?;
         let stripped_str = info_str.replace(&[' ', '\n', '\r'][..], "");
         let info_bytes = hex::decode(&stripped_str)?;
-        let device_info = DeviceInfo::from(&info_bytes[..]);
+        let device_info = DeviceInfo::try_from(&info_bytes[..])?;
 
         Ok(device_info)
     }
