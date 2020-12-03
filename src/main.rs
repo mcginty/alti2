@@ -5,7 +5,7 @@ use serial::core::{SerialDevice, SerialPortSettings};
 use serial::{BaudRate, Parity, CharSize, FlowControl, StopBits};
 use std::thread::sleep;
 use std::fmt;
-use anyhow::Error;
+use anyhow::{ensure, Error};
 
 static TTY_TIMEOUT: Duration = Duration::from_millis(10000);
 static PAUSE_BEFORE_HANDSHAKE: Duration = Duration::from_secs(10);
@@ -61,6 +61,12 @@ struct DeviceInfo {
     nvram_config: u8,
 }
 
+impl fmt::Display for DeviceInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Alti-2 {:?} (rev. {}, S/N {}, S/W {})", self.product_type, self.hardware_revision, self.serial_number, self.sw_version)
+    }
+}
+
 impl<'a> From<&'a [u8]> for DeviceInfo {
     fn from(bytes: &[u8]) -> Self {
         Self {
@@ -77,6 +83,30 @@ impl<'a> From<&'a [u8]> for DeviceInfo {
             nvram_config: bytes[16],
         }
     }
+}
+
+enum Command {
+    GetInfo,
+}
+
+impl Command {
+    /// Handles all the weird formatting the device expects. Ex: turns the 0x80 command into
+    /// the string "018080", prepending the length and appending the checksum.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let contents = match self {
+            Command::GetInfo => vec![0x80]
+        };
+        let mut bytes = vec![];
+        bytes.extend_from_slice(hex::encode_upper(&[contents.len() as u8]).as_bytes());
+        bytes.extend_from_slice(hex::encode_upper(&contents).as_bytes());
+        bytes.extend_from_slice(hex::encode_upper(&[checksum(&contents)]).as_bytes());
+        bytes
+    }
+}
+
+fn checksum(bytes: &[u8]) -> u8 {
+    bytes.iter()
+        .fold(0, |acc, b| acc.wrapping_add(*b))
 }
 
 struct AltiTTY {
@@ -101,21 +131,23 @@ impl AltiTTY {
     }
 
     fn device_info(&mut self) -> Result<DeviceInfo, Error> {
-        self.tty.write_all(b"018080")?;
+        self.tty.write_all(&Command::GetInfo.to_bytes())?;
 
         sleep(Duration::from_millis(100));
 
         let mut buf = [0u8; 1024];
-        let mut pos = 0;
 
-        while let Ok(amount_read) = self.tty.read(&mut buf[pos..]) {
-            pos += amount_read;
-        }
-        let info_str = String::from_utf8(buf[..pos].to_vec())?;
-        println!("raw response ({}b): \"{}\"", info_str, info_str.len());
+        // Read just the length (in "XX " hex ASCII format).
+        self.tty.read_exact(&mut buf[..3])?;
+        let len = hex::decode(String::from_utf8(buf[0..2].to_vec())?)?[0] as usize;
 
+        // (len+1) to include the checksum byte, multiply by 3 for each "XX " spaced combination of hex,
+        // then add 2 for the "\r\n" ending.
+        let remaining_ascii_len = (len+1) * 3 + 2;
+        self.tty.read_exact(&mut buf[3..3+remaining_ascii_len])?;
+
+        let info_str = String::from_utf8(buf[..2+remaining_ascii_len].to_vec())?;
         let stripped_str = info_str.replace(&[' ', '\n', '\r'][..], "");
-        println!("stripped: {}", info_str);
         let info_bytes = hex::decode(&stripped_str)?;
         let device_info = DeviceInfo::from(&info_bytes[..]);
 
@@ -124,13 +156,13 @@ impl AltiTTY {
 }
 
 fn main() -> Result<(), Error> {
-
+    println!("opening TTY (will pause for 10 seconds to wait for ready state)");
     let mut tty = AltiTTY::open("/dev/ttyUSB0")?;
     println!("successfully opened TTY.");
 
     println!("requesting device info.");
     let device_info = tty.device_info()?;
-    println!("device info: {:?}", device_info);
+    println!("device: {}", device_info);
 
     Ok(())
 }
