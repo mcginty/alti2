@@ -19,7 +19,6 @@ fn checksum(bytes: &[u8]) -> u8 {
     bytes.iter().fold(0, |acc, b| acc.wrapping_add(*b))
 }
 
-#[derive(Debug)]
 struct SoftwareVersion {
     major: usize,
     minor: usize,
@@ -59,15 +58,11 @@ impl From<u8> for ProductType {
     }
 }
 
-#[derive(Debug)]
 struct DeviceInfo {
-    original_record: Vec<u8>,
-    comm_type: u8,
     sw_version: SoftwareVersion,
     serial_number: String,
     hardware_revision: u8,
     product_type: ProductType,
-    nvram_config: u8,
 }
 
 impl fmt::Display for DeviceInfo {
@@ -84,11 +79,12 @@ impl<'a> TryFrom<&'a [u8]> for DeviceInfo {
     type Error = Error;
 
     fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
-        ensure!(checksum(&bytes[1..bytes.len()-1]) == bytes[bytes.len()-1], "checksum mismatch");
+        ensure!(
+            checksum(&bytes[1..bytes.len() - 1]) == bytes[bytes.len() - 1],
+            "checksum mismatch"
+        );
 
         Ok(Self {
-            original_record: bytes.to_vec(),
-            comm_type: bytes[2],
             sw_version: SoftwareVersion {
                 major: (bytes[3] >> 4) as usize,
                 minor: (bytes[3] & 0x0f) as usize,
@@ -97,7 +93,6 @@ impl<'a> TryFrom<&'a [u8]> for DeviceInfo {
             serial_number: String::from_utf8(bytes[5..14].to_vec())?.trim().to_string(),
             hardware_revision: bytes[14],
             product_type: ProductType::from(bytes[15]),
-            nvram_config: bytes[16],
         })
     }
 }
@@ -121,12 +116,105 @@ impl Command {
     }
 }
 
-struct AltiTTY {
-    tty: serial::unix::TTYPort,
+struct Cipher {
+    k: [u32; 4],
 }
 
-impl AltiTTY {
-    fn open(path: &str) -> Result<Self, Error> {
+impl Cipher {
+    fn from_type0_bytes(bytes: &[u8]) -> Self {
+        Self {
+            k: [
+                u32::from_le_bytes([78, bytes[8], bytes[26], bytes[24]]),
+                u32::from_le_bytes([bytes[6], bytes[25], bytes[23], bytes[13]]),
+                u32::from_le_bytes([bytes[10], 117, bytes[7], bytes[22]]),
+                u32::from_le_bytes([bytes[9], bytes[11], 126, bytes[21]]),
+            ],
+        }
+    }
+
+    pub fn encrypt_single(&self, v: &[u32]) -> [u32; 2] {
+        let mut u = v[0];
+        let mut u1 = v[1];
+        let mut u2 = 0u32;
+
+        for _ in 0..16 {
+            u += (((u1 << 4) ^ (u1 >> 5)) + u1) ^ (u2 + self.k[(u2 & 3) as usize]);
+            u2 += 0x9E3779B9;
+            u1 += (((u << 4) ^ (u >> 5)) + u) ^ (u2 + self.k[((u2 >> 11) & 3) as usize]);
+        }
+
+        [u, u1]
+    }
+
+    pub fn decrypt_single(&self, v: &[u32]) -> [u32; 2] {
+        let mut u = v[0];
+        let mut u1 = v[1];
+        let mut u2 = 0xE3779B90;
+
+        for _ in 0..16 {
+            u1 -= (((u << 4) ^ (u >> 5)) + u) ^ (u2 + self.k[((u2 >> 11) & 3) as usize]);
+            u2 -= 0x9E3779B9;
+            u -= (((u1 << 4) ^ (u1 >> 5)) + u1) ^ (u2 + self.k[(u2 & 3) as usize]);
+        }
+
+        [u, u1]
+    }
+
+    pub fn encrypt(&self, bytes: &[u8]) -> Vec<u8> {
+        let u32s: Vec<u32> = bytes
+            .chunks(4)
+            .map(|chunk| {
+                let mut b = [0u8; 4];
+                b[..chunk.len()].copy_from_slice(chunk);
+                u32::from_le_bytes(b)
+            })
+            .collect();
+
+        let pairs = u32s.chunks_exact(2);
+        pairs
+            .map(|pair| {
+                let enc_pair = self.encrypt_single(pair);
+                let mut bytes = Vec::with_capacity(8);
+                bytes.extend_from_slice(&enc_pair[0].to_le_bytes());
+                bytes.extend_from_slice(&enc_pair[1].to_le_bytes());
+                bytes
+            })
+            .flatten()
+            .collect()
+    }
+
+    pub fn decrypt(&self, bytes: &[u8]) -> Vec<u8> {
+        let u32s: Vec<u32> = bytes
+            .chunks(4)
+            .map(|chunk| {
+                let mut b = [0u8; 4];
+                b[..chunk.len()].copy_from_slice(chunk);
+                u32::from_le_bytes(b)
+            })
+            .collect();
+
+        let pairs = u32s.chunks_exact(2);
+        pairs
+            .map(|pair| {
+                let enc_pair = self.decrypt_single(pair);
+                let mut bytes = Vec::with_capacity(8);
+                bytes.extend_from_slice(&enc_pair[0].to_le_bytes());
+                bytes.extend_from_slice(&enc_pair[1].to_le_bytes());
+                bytes
+            })
+            .flatten()
+            .collect()
+    }
+}
+
+struct Session {
+    tty: serial::unix::TTYPort,
+    pub device_info: DeviceInfo,
+    cipher: Cipher,
+}
+
+impl Session {
+    pub fn open(path: &str) -> Result<Self, Error> {
         let mut tty = serial::unix::TTYPort::open(Path::new(path)).unwrap();
         tty.set_timeout(TTY_TIMEOUT).unwrap();
         let mut settings = tty.read_settings().unwrap();
@@ -139,42 +227,41 @@ impl AltiTTY {
         tty.set_dtr(true).unwrap();
 
         sleep(PAUSE_BEFORE_HANDSHAKE);
-        Ok(Self { tty })
+        let type0_bytes = Self::get_type0(&mut tty)?;
+        let device_info = DeviceInfo::try_from(&type0_bytes[..])?;
+        let cipher = Cipher::from_type0_bytes(&type0_bytes);
+        Ok(Self { tty, device_info, cipher })
     }
 
-    fn device_info(&mut self) -> Result<DeviceInfo, Error> {
-        self.tty.write_all(&Command::GetInfo.to_bytes())?;
+    fn get_type0(tty: &mut serial::unix::TTYPort) -> Result<Vec<u8>, Error> {
+        tty.write_all(&Command::GetInfo.to_bytes())?;
 
         sleep(Duration::from_millis(100));
 
         let mut buf = [0u8; 1024];
 
         // Read just the length (in "XX " hex ASCII format).
-        self.tty.read_exact(&mut buf[..3])?;
+        tty.read_exact(&mut buf[..3])?;
         let len = hex::decode(String::from_utf8(buf[0..2].to_vec())?)?[0] as usize;
 
         // (len+1) to include the checksum byte, multiply by 3 for each "XX " spaced combination of hex,
         // then add 2 for the "\r\n" ending.
         let remaining_ascii_len = (len + 1) * 3 + 2;
-        self.tty.read_exact(&mut buf[3..3 + remaining_ascii_len])?;
+        tty.read_exact(&mut buf[3..3 + remaining_ascii_len])?;
 
         let info_str = String::from_utf8(buf[..2 + remaining_ascii_len].to_vec())?;
         let stripped_str = info_str.replace(&[' ', '\n', '\r'][..], "");
         let info_bytes = hex::decode(&stripped_str)?;
-        let device_info = DeviceInfo::try_from(&info_bytes[..])?;
 
-        Ok(device_info)
+        Ok(info_bytes)
     }
 }
 
 fn main() -> Result<(), Error> {
     println!("opening TTY (will pause for 10 seconds to wait for ready state)");
-    let mut tty = AltiTTY::open("/dev/ttyUSB0")?;
+    let mut session = Session::open("/dev/ttyUSB0")?;
     println!("successfully opened TTY.");
-
-    println!("requesting device info.");
-    let device_info = tty.device_info()?;
-    println!("device: {}", device_info);
+    println!("device: {}", session.device_info);
 
     Ok(())
 }
